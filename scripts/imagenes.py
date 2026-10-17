@@ -10,7 +10,8 @@ Para cada carta sin foto busca la de la misma carta en otro sitio:
      en.onepiece-cardgame.com (One Piece), en.ws-tcg.com (Weiss Schwarz) y Scryfall (Magic), por expansión y
      número o por código.
 
-Genera data/imagenes-cartas.json: {"actualizado": "...", "imagenes": {"<productId>": "<url>"}}.
+Genera data/imagenes-cartas.json: {"actualizado": "...", "imagenes": {"<productId>": "<url>"}, "vacias": [<groupId>]}
+(«vacias»: expansiones sin ningún producto en el catálogo, que la app no enseña).
 Uso: python3 scripts/imagenes.py data/imagenes-cartas.json
 Lo leído de pokemon-card.com se guarda en data/pokemon-jp.json para no volver a pedirlo cada día.
 """
@@ -34,7 +35,7 @@ CODE_GAMES = {68, 63, 80, 86, 81, 89, 62, 20, 2}
 NAME_GAMES = {2, 20, 89, 62, 79}
 # Promos de Pokémon: grupo de TCGplayer → expansión de TCGdex.
 POKEMON_PROMOS = {24451: "mep", 22872: "svp", 2545: "swshp", 1861: "smp", 1451: "xyp", 1407: "bwp",
-                  1453: "hgssp", 1421: "dpp", 1423: "np", 1418: "basep"}
+                  1453: "hgssp", 1421: "dpp", 1423: "np", 1418: "basep", 23237: "sv03.5"}
 
 
 def get(url, tries=3):
@@ -67,10 +68,16 @@ def letters(text):
 
 
 def load_category(category):
+    """Grupos, cartas (con número) y grupos vacíos (sin ningún producto) de una categoría."""
     groups = (get(f"{TCGCSV}/{category}/groups") or {}).get("results", [])
+    empty = []
 
     def fetch(group):
-        data = get(f"{TCGCSV}/{category}/{group['groupId']}/products") or {"results": []}
+        data = get(f"{TCGCSV}/{category}/{group['groupId']}/products")
+        # Solo cuenta como vacía si se ha podido leer (un fallo de red no es una expansión vacía).
+        if data is not None and not data.get("results"):
+            empty.append(group["groupId"])
+        data = data or {"results": []}
         rows = []
         for product in data["results"]:
             number = next((e["value"] for e in product.get("extendedData", []) if e["name"] == "Number"), None)
@@ -82,7 +89,7 @@ def load_category(category):
 
     with cf.ThreadPoolExecutor(16) as pool:
         products = [row for rows in pool.map(fetch, groups) for row in rows]
-    return {g["groupId"]: g["name"] for g in groups}, products
+    return {g["groupId"]: g["name"] for g in groups}, products, empty
 
 
 def tcgdex_images(language, set_ids):
@@ -105,8 +112,9 @@ def pokemon_sets(category, groups):
             if group_id in POKEMON_PROMOS:
                 result[group_id] = POKEMON_PROMOS[group_id]
                 continue
-            short = letters(name.split(":")[-1])
-            match = next((s["id"] for s in sets if letters(s["name"]) == short), None)
+            # «SV: Surging Sparks» y «SM - Cosmic Eclipse» → «Surging Sparks», «Cosmic Eclipse».
+            options = {letters(name.split(":")[-1]), letters(name.split(" - ")[-1])}
+            match = next((s["id"] for s in sets if letters(s["name"]) in options), None)
         else:
             code = name.split(":")[0].strip().lower()
             match = next((s["id"] for s in sets if s["id"].lower() == code), None)
@@ -195,6 +203,13 @@ def scryfall(missing):
         data = get(f"https://api.scryfall.com/cards/search?q={query}&unique=prints") or {}
         time.sleep(0.12)
         cards = data.get("data") or []
+        if not cards:
+            # TCGplayer y Scryfall numeran distinto algunas expansiones («Commander: Marvel Super Heroes»): por
+            # nombre, y solo vale si todas sus ediciones tienen la misma ilustración (se comprueba más abajo).
+            query = urllib.parse.quote(f'!"{base_name(product["name"])}"')
+            data = get(f"https://api.scryfall.com/cards/search?q={query}&unique=prints") or {}
+            time.sleep(0.12)
+            cards = data.get("data") or []
         # La versión numerada («Serial Numbered») es la «559z»; si no, la del número exacto.
         serial = any("serial" in t.lower() for t in tags(product["name"]))
         exact = [c for c in cards if ("serialized" in (c.get("promo_types") or [])) == serial] or cards
@@ -283,9 +298,10 @@ def pokemon_jp_official(missing, groups, cache_path):
 
 
 def build(cache_path):
-    images = {}
+    images, empty = {}, []
     for category in CATEGORIES:
-        groups, products = load_category(category)
+        groups, products, empty_groups = load_category(category)
+        empty += empty_groups
         with_image = [p for p in products if p["images"] and p["url"]]
         missing = [p for p in products if not p["images"]]
         by_code, by_name = {}, {}
@@ -329,21 +345,24 @@ def build(cache_path):
             extra |= official_by_code(rest, "https://en.ws-tcg.com/wordpress/wp-content/images/cardimages/{code}.png",
                                       weiss_path, exact=True)
         images |= extra
-        print(f"categoría {category}: {len(missing)} sin foto, {found + len(extra)} con foto de reserva", flush=True)
-    return images
+        print(f"categoría {category}: {len(missing)} sin foto, {found + len(extra)} con foto de reserva, "
+              f"{len(empty_groups)} expansiones vacías", flush=True)
+    return images, sorted(empty)
 
 
 if __name__ == "__main__":
-    images = build(os.path.join(os.path.dirname(sys.argv[1]) or ".", "pokemon-jp.json"))
+    images, empty = build(os.path.join(os.path.dirname(sys.argv[1]) or ".", "pokemon-jp.json"))
     # Si la lista no ha cambiado, no se reescribe (así no hay un commit nuevo cada día).
     try:
         with open(sys.argv[1]) as file:
-            if json.load(file).get("imagenes") == images:
+            previous = json.load(file)
+            if previous.get("imagenes") == images and previous.get("vacias") == empty:
                 print("sin cambios:", len(images), "fotos de reserva")
                 sys.exit(0)
     except (OSError, ValueError):
         pass
-    result = {"actualizado": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "imagenes": images}
+    result = {"actualizado": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "imagenes": images,
+              "vacias": empty}
     with open(sys.argv[1], "w") as file:
         json.dump(result, file, separators=(",", ":"), sort_keys=True)
     print(len(images), "fotos de reserva")
