@@ -75,7 +75,13 @@ def main(output):
     images = {}
     for set_id in set_ids:
         detail = get(f"{TCGDEX}/es/sets/{set_id}") or {}
-        missing = [c for c in detail.get("cards", []) if not c.get("image")]
+        spanish = detail.get("cards", [])
+        if spanish:
+            missing = [c for c in spanish if not c.get("image")]
+        else:
+            # TCGdex no tiene las cartas en español de muchas expansiones antiguas (Diamante y Perla, HeartGold,
+            # Platino…): se buscan todas las de la versión inglesa (mismos ids).
+            missing = (get(f"{TCGDEX}/en/sets/{set_id}") or {}).get("cards", [])
         if not missing:
             continue
         code = find_code(set_id, missing)
