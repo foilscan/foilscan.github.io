@@ -1,5 +1,5 @@
 # Cada día actualiza los datos que descarga la app FoilScan: precios de Cardmarket, fotos de reserva de las cartas sin
-# imagen, fotos oficiales en español y la lista de cartas de One Piece en japonés.
+# imagen, fotos oficiales en español, la lista de cartas de One Piece en japonés y el índice de cartas Pokémon japonesas.
 name: Datos diarios
 on:
   schedule:
@@ -25,6 +25,9 @@ jobs:
         continue-on-error: true
       - name: One Piece en japonés
         run: python3 scripts/onepiece_ja.py data/onepiece-ja.json
+        continue-on-error: true
+      - name: Índice de cartas japonesas (escáner de cartas chinas y coreanas)
+        run: python3 scripts/japon.py data/pokemon-japon.json
         continue-on-error: true
       - name: Guardar si ha cambiado
         run: |
