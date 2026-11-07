@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import urllib.request
+import zlib
 
 TCGDEX = "https://api.tcgdex.net/v2"
 GUIDE = "https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_6.json"
@@ -55,6 +56,10 @@ def main(output):
         known = {}
     ids = card_ids()
     missing = sorted(i for i in ids if i not in known)
+    # Las apuntadas sin producto (0) se vuelven a pedir una vez por semana, un séptimo cada día: TCGdex va añadiendo
+    # productos (antes se quedaban sin precio para siempre, como las 94 de Hidden Fates Shiny Vault).
+    weekday = datetime.date.today().weekday()
+    missing += sorted(i for i in ids if known.get(i) == 0 and zlib.crc32(i.encode()) % 7 == weekday)
     print(f"{len(ids)} cartas en TCGdex; {len(missing)} sin producto de Cardmarket conocido", flush=True)
     with cf.ThreadPoolExecutor(8) as pool:
         for count, (card_id, product) in enumerate(pool.map(product_of, missing), start=1):

@@ -10,8 +10,9 @@ Para cada carta sin foto busca la de la misma carta en otro sitio:
      en.onepiece-cardgame.com (One Piece), en.ws-tcg.com (Weiss Schwarz) y Scryfall (Magic), por expansión y
      número o por código.
 
-Genera data/imagenes-cartas.json: {"actualizado": "...", "imagenes": {"<productId>": "<url>"}, "vacias": [<groupId>]}
-(«vacias»: expansiones sin ningún producto en el catálogo, que la app no enseña).
+Genera data/imagenes-cartas.json: {"actualizado": "...", "imagenes": {"<productId>": "<url>"}, "vacias": [<groupId>],
+"nitidas": {"<productId>": "<url>"}} («vacias»: expansiones sin ningún producto en el catálogo, que la app no enseña;
+«nitidas»: cartas Pokémon en inglés con foto pequeña en TCGplayer, con la grande de TCGdex).
 Uso: python3 scripts/imagenes.py data/imagenes-cartas.json
 Lo leído de pokemon-card.com se guarda en data/pokemon-jp.json para no volver a pedirlo cada día.
 """
@@ -67,9 +68,14 @@ def letters(text):
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+# Abreviatura de cada grupo («M-P», «SV-P»): en las promos japonesas el nombre no lleva el código delante.
+ABBREVIATIONS = {}
+
+
 def load_category(category):
     """Grupos, cartas (con número) y grupos vacíos (sin ningún producto) de una categoría."""
     groups = (get(f"{TCGCSV}/{category}/groups") or {}).get("results", [])
+    ABBREVIATIONS.update({g["groupId"]: (g.get("abbreviation") or "").strip() for g in groups})
     empty = []
 
     def fetch(group):
@@ -102,6 +108,12 @@ def tcgdex_images(language, set_ids):
         return dict(pool.map(fetch, set_ids))
 
 
+def set_letters(name):
+    name = re.sub(r"\band\b|&", " ", name, flags=re.I)
+    name = re.sub(r"\bpromos\b", "collection", name, flags=re.I)
+    return letters(re.sub(r"\s+base set$", "", name.strip(), flags=re.I))
+
+
 def pokemon_sets(category, groups):
     """Expansión de TCGdex de cada grupo de TCGplayer (por nombre en inglés, por código en japonés)."""
     language = "en" if category == 3 else "ja"
@@ -112,9 +124,11 @@ def pokemon_sets(category, groups):
             if group_id in POKEMON_PROMOS:
                 result[group_id] = POKEMON_PROMOS[group_id]
                 continue
-            # «SV: Surging Sparks» y «SM - Cosmic Eclipse» → «Surging Sparks», «Cosmic Eclipse».
-            options = {letters(name.split(":")[-1]), letters(name.split(" - ")[-1])}
-            match = next((s["id"] for s in sets if letters(s["name"]) in options), None)
+            # «SV: Surging Sparks» y «SM - Cosmic Eclipse» → «Surging Sparks», «Cosmic Eclipse». También «EX Holon
+            # Phantoms» = «Holon Phantoms», «Diamond and Pearl» = «Diamond & Pearl», «Expedition» = «Expedition Base
+            # Set» y «McDonald's Promos 2014» = «McDonald's Collection 2014».
+            options = {set_letters(name.split(":")[-1]), set_letters(name.split(" - ")[-1]), set_letters(re.sub(r"^EX ", "", name))}
+            match = next((s["id"] for s in sets if set_letters(s["name"]) in options), None)
         else:
             code = name.split(":")[0].strip().lower()
             match = next((s["id"] for s in sets if s["id"].lower() == code), None)
@@ -167,6 +181,29 @@ def finish_variants(missing, with_image):
 def plain(product):
     """Sin etiquetas de ilustración alternativa: la foto oficial de la carta normal le sirve."""
     return not any(ALTERNATE.search(t) for t in tags(product["name"]))
+
+
+def championship_originals(missing, with_image, groups):
+    """Mazos de campeonato del mundo (World Championship Decks): reimpresiones con el mismo dibujo, número y total que
+    la carta original («Mewtwo EX - 2012 (Igor Costa)», 54/99 → la Mewtwo EX 54/99 de Next Destinies). Ni TCGplayer ni
+    TCGdex tienen sus fotos: la de la original."""
+    def key(name, number):
+        parts = number.split("/")
+        if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
+            return None
+        base = re.sub(r"\s*\(.*?\)|\s*\[.*?\]|\s+-\s+.*$", "", name)
+        return letters(base), int(parts[0]), int(parts[1])
+    index = {}
+    for product in with_image:
+        if "championship deck" not in groups.get(product["group"], "").lower():
+            index.setdefault(key(product["name"], product["number"]), product["url"])
+    found = {}
+    for product in missing:
+        if "championship deck" in groups.get(product["group"], "").lower():
+            url = index.get(key(product["name"], product["number"]))
+            if url:
+                found[str(product["id"])] = url
+    return found
 
 
 def exists(url):
@@ -248,12 +285,20 @@ def pokemon_jp_official(missing, groups, cache_path):
         if not plain(product):
             continue
         code = groups.get(product["group"], "").split(":")[0].strip()
+        # «M-P Promotional Cards» no lleva el código delante: el de la abreviatura.
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{1,7}", code):
+            code = ABBREVIATIONS.get(product["group"], "")
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{1,7}", code):
             wanted.setdefault(code, []).append(product)
     found = {}
+    # Las promos («M-P», «SV-P») siguen saliendo: se vuelven a pedir cada semana (las expansiones, una vez).
+    checked = cache.setdefault("_fechas", {})
+    today = time.strftime("%Y-%m-%d")
     for code, products in wanted.items():
         entry = cache.get(code)
-        if entry is None:
+        stale = code.endswith("-P") and checked.get(code, "") < time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400))
+        if entry is None or stale:
+            checked[code] = today
             entry = {}
             first = get(f"{POKEMON_JP_SITE}/card-search/resultAPI.php?keyword=&regulation_sidebar_form=all&pg={code}&page=1")
             if first and first.get("hitCnt"):
@@ -297,8 +342,108 @@ def pokemon_jp_official(missing, groups, cache_path):
     return found
 
 
+def jpeg_width(data):
+    """Ancho de una foto JPEG por su cabecera (marcador SOF), o None."""
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            return int.from_bytes(data[i + 7:i + 9], "big")
+        if marker == 0xFF or marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            i += 1 if marker == 0xFF else 2
+            continue
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return None
+
+
+def tcgplayer_width(product_id):
+    """Ancho de la foto grande de TCGplayer leyendo solo el principio del archivo (None si no se ha podido)."""
+    url = f"https://tcgplayer-cdn.tcgplayer.com/product/{product_id}_in_1000x1000.jpg"
+    for size in (16384, 131072):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "FoilScan image index", "Range": f"bytes=0-{size - 1}"})
+            width = jpeg_width(urllib.request.urlopen(request, timeout=30).read())
+        except Exception:
+            return None
+        if width:
+            return width
+    return None
+
+
+# Por debajo de este ancho la foto de TCGplayer se ve borrosa (hay expansiones enteras a 200 px: Base Set, Expedition,
+# EX Holon Phantoms, XY BREAKthrough…) y el escáner la compara peor con la foto de la cámara.
+SMALL = 400
+
+
+def pokemon_sharper(with_image, groups, widths_path):
+    """Pokémon en inglés con foto pequeña en TCGplayer: la de TCGdex (misma expansión y número), que es grande.
+    Los anchos medidos se guardan en `widths_path` para medir cada día solo las cartas nuevas."""
+    try:
+        with open(widths_path) as file:
+            widths = json.load(file)
+    except (OSError, ValueError):
+        widths = {}
+    pending = [p for p in with_image if str(p["id"]) not in widths]
+    with cf.ThreadPoolExecutor(8) as pool:
+        for product, width in zip(pending, pool.map(lambda p: tcgplayer_width(p["id"]), pending)):
+            if width:
+                widths[str(product["id"])] = width
+    with open(widths_path, "w") as file:
+        json.dump(widths, file, separators=(",", ":"), sort_keys=True)
+    small = [p for p in with_image if widths.get(str(p["id"]), SMALL) < SMALL]
+    if not small:
+        return {}
+    language, mapping = pokemon_sets(3, groups)
+    dex = tcgdex_images(language, {mapping[p["group"]] for p in small if p["group"] in mapping})
+    result = {}
+    for product in small:
+        url = dex.get(mapping.get(product["group"]), {}).get(number_key(product["number"]))
+        if url:
+            result[str(product["id"])] = url
+    result |= reprint_originals([p for p in small if str(p["id"]) not in result and plain(p)])
+    print(f"Pokémon: {len(small)} con foto pequeña, {len(result)} con la de TCGdex", flush=True)
+    return result
+
+
+def reprint_originals(products):
+    """Reimpresiones de otra expansión (Deck Exclusives, League & Championship, Prize Pack…): llevan el número y el total
+    de la original («Garchomp - 5/147 (Championship Promo)» → la Garchomp 5/147 de Supreme Victors). Por número, total
+    y nombre en las expansiones de TCGdex con ese total."""
+    wanted = {}
+    for product in products:
+        match = re.match(r"^0*(\d+)[a-z]?/0*(\d+)$", product["number"].strip())
+        if match:
+            wanted[str(product["id"])] = (letters(base_name(product["name"])), match.group(1), int(match.group(2)))
+    if not wanted:
+        return {}
+    sets = get(f"{TCGDEX}/en/sets") or []
+    by_total = {}
+    for item in sets:
+        by_total.setdefault((item.get("cardCount") or {}).get("official"), []).append(item["id"])
+    needed = {set_id for _, _, total in wanted.values() for set_id in by_total.get(total, [])}
+
+    def fetch(set_id):
+        data = get(f"{TCGDEX}/en/sets/{set_id}") or {}
+        return set_id, {(number_key(c["localId"]), letters(c["name"])): f"{c['image']}/low.webp"
+                        for c in data.get("cards", []) if c.get("image")}
+
+    with cf.ThreadPoolExecutor(8) as pool:
+        cards = dict(pool.map(fetch, needed))
+    found = {}
+    for product_id, (name, number, total) in wanted.items():
+        for set_id in by_total.get(total, []):
+            url = cards.get(set_id, {}).get((number, name))
+            if url:
+                found[product_id] = url
+                break
+    return found
+
+
 def build(cache_path):
-    images, empty = {}, []
+    images, empty, sharper = {}, [], {}
     for category in CATEGORIES:
         groups, products, empty_groups = load_category(category)
         empty += empty_groups
@@ -306,7 +451,10 @@ def build(cache_path):
         missing = [p for p in products if not p["images"]]
         by_code, by_name = {}, {}
         for product in with_image:
-            by_code.setdefault(product["number"].strip().upper(), product["url"])
+            # Por código, solo la foto de la carta normal (antes la primera que salía, y una «Alternate Art» o una «SP»
+            # daba su dibujo a la normal).
+            if plain(product):
+                by_code.setdefault(product["number"].strip().upper(), product["url"])
             by_name.setdefault(clean_name(product["name"]), product["url"])
         pokemon = {}
         if category in (3, 85) and missing:
@@ -320,7 +468,7 @@ def build(cache_path):
             if category in (3, 85):
                 url = pokemon.get(product["group"], {}).get(number_key(product["number"]))
             code = product["number"].strip().upper()
-            if url is None and category in CODE_GAMES and "/" not in code and re.search(r"[A-Z]", code):
+            if url is None and category in CODE_GAMES and "/" not in code and re.search(r"[A-Z]", code) and plain(product):
                 url = by_code.get(code)
             if url is None and category in NAME_GAMES:
                 url = by_name.get(clean_name(product["name"]))
@@ -331,6 +479,9 @@ def build(cache_path):
         rest = [p for p in missing if str(p["id"]) not in images]
         extra = finish_variants(rest, with_image)
         rest = [p for p in rest if str(p["id"]) not in extra]
+        if category == 3:
+            extra |= championship_originals(rest, with_image, groups)
+            sharper = pokemon_sharper(with_image, groups, os.path.join(os.path.dirname(cache_path), "anchos-tcgplayer.json"))
         if category == 85:
             extra |= pokemon_jp_official(rest, groups, cache_path)
         elif category == 63:
@@ -347,22 +498,22 @@ def build(cache_path):
         images |= extra
         print(f"categoría {category}: {len(missing)} sin foto, {found + len(extra)} con foto de reserva, "
               f"{len(empty_groups)} expansiones vacías", flush=True)
-    return images, sorted(empty)
+    return images, sorted(empty), sharper
 
 
 if __name__ == "__main__":
-    images, empty = build(os.path.join(os.path.dirname(sys.argv[1]) or ".", "pokemon-jp.json"))
+    images, empty, sharper = build(os.path.join(os.path.dirname(sys.argv[1]) or ".", "pokemon-jp.json"))
     # Si la lista no ha cambiado, no se reescribe (así no hay un commit nuevo cada día).
     try:
         with open(sys.argv[1]) as file:
             previous = json.load(file)
-            if previous.get("imagenes") == images and previous.get("vacias") == empty:
+            if previous.get("imagenes") == images and previous.get("vacias") == empty and previous.get("nitidas") == sharper:
                 print("sin cambios:", len(images), "fotos de reserva")
                 sys.exit(0)
     except (OSError, ValueError):
         pass
     result = {"actualizado": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "imagenes": images,
-              "vacias": empty}
+              "vacias": empty, "nitidas": sharper}
     with open(sys.argv[1], "w") as file:
         json.dump(result, file, separators=(",", ":"), sort_keys=True)
     print(len(images), "fotos de reserva")
