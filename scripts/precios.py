@@ -6,12 +6,19 @@ producto de Cardmarket es cada carta (el mismo id de carta sirve para todos sus 
 Genera data/precios-cardmarket.json: {"actualizado": "...", "eur": {"me01-186": 19.33, ...}}.
 Lo que ya se sabe de TCGdex (carta → producto de Cardmarket) se guarda en data/cardmarket-ids.json para no volver
 a pedirlo cada día: solo se piden las cartas nuevas.
+
+TCGdex no tiene el producto de algunas expansiones (Gym Heroes y Challenge, Shiny Vault de Hidden Fates, promos…) y
+en otras da el de otra versión de la carta (las dos Patrat de Black & White con el mismo producto). Con el catálogo
+público de Cardmarket (nombre y ataques de cada producto, «Patrat [Hyper Fang]») se empareja cada carta por nombre y
+ataques dentro de su expansión de Cardmarket; si sale un solo producto, ese. El nombre y los ataques de cada carta de
+TCGdex se guardan en data/tcgdex-firmas.json (solo se piden las nuevas).
 Uso: python3 scripts/precios.py data/precios-cardmarket.json
 """
 import concurrent.futures as cf
 import datetime
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -19,6 +26,9 @@ import zlib
 
 TCGDEX = "https://api.tcgdex.net/v2"
 GUIDE = "https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_6.json"
+CATALOG = "https://downloads.s3.cardmarket.com/productCatalog/productList/products_singles_6.json"
+# TCG Pocket (el juego para móvil): no tiene cartas en Cardmarket.
+POCKET = re.compile(r"^(A\d|B\d|P-A|P-B)")
 
 
 def get(url, tries=3):
@@ -44,6 +54,84 @@ def product_of(card_id):
     data = get(f"{TCGDEX}/en/cards/{card_id}") or {}
     market = (data.get("pricing") or {}).get("cardmarket") or {}
     return card_id, market.get("idProduct")
+
+
+def signature(card_id):
+    """Nombre y ataques (y habilidades) de una carta de TCGdex."""
+    data = get(f"{TCGDEX}/en/cards/{card_id}")
+    if not data:
+        return card_id, None
+    moves = [m.get("name") for m in (data.get("attacks") or []) + (data.get("abilities") or []) if m.get("name")]
+    return card_id, [data.get("name"), moves]
+
+
+def plain(text):
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def by_catalog(known, folder):
+    """Producto de Cardmarket de cada carta por nombre y ataques (ver arriba). Devuelve {carta: producto} solo para las
+    que TCGdex no tiene o tiene con un producto de otros ataques."""
+    path = os.path.join(folder, "tcgdex-firmas.json")
+    try:
+        with open(path) as file:
+            signatures = json.load(file)
+    except (OSError, ValueError):
+        signatures = {}
+    pending = sorted(i for i in known if i not in signatures and not POCKET.match(i))
+    with cf.ThreadPoolExecutor(6) as pool:
+        for card_id, value in pool.map(signature, pending):
+            if value:
+                signatures[card_id] = value
+    with open(path, "w") as file:
+        json.dump(signatures, file, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    catalog = [p for p in (get(CATALOG) or {}).get("products", []) if p.get("idCategory") == 51]
+    if not catalog:
+        return {}
+    products = {p["idProduct"]: p for p in catalog}
+    expansions = {}
+    for product in catalog:
+        expansions.setdefault(product["idExpansion"], []).append(product)
+
+    def base(name):
+        return plain(name.split(" [")[0].split(" (")[0])
+
+    def moves(name):
+        match = re.search(r"\[(.*)\]", name)
+        return frozenset(plain(m) for m in match.group(1).split("|")) if match else frozenset()
+
+    set_of = lambda card_id: card_id.rsplit("-", 1)[0]
+    votes = {}
+    for card_id, product in known.items():
+        if product in products:
+            votes.setdefault(set_of(card_id), {}).setdefault(products[product]["idExpansion"], 0)
+            votes[set_of(card_id)][products[product]["idExpansion"]] += 1
+    by_set = {}
+    for card_id in signatures:
+        by_set.setdefault(set_of(card_id), []).append(card_id)
+    found = {}
+    for set_id, ids in by_set.items():
+        if votes.get(set_id):
+            expansion = max(votes[set_id], key=votes[set_id].get)
+        else:
+            # Ninguna con producto: la expansión de Cardmarket con más nombres de esta expansión (la mitad, al menos).
+            names = {base(signatures[i][0]) for i in ids}
+            best = max(((len(names & {base(p["name"]) for p in ps}), e) for e, ps in expansions.items()), default=(0, None))
+            expansion = best[1] if best[0] >= max(3, len(names) * 0.5) else None
+        for card_id in ids:
+            name, card_moves = signatures[card_id]
+            card_moves = frozenset(plain(m) for m in card_moves)
+            same = [p for p in expansions.get(expansion, []) if base(p["name"]) == base(name)]
+            if len(same) > 1 and card_moves:
+                same = [p for p in same if moves(p["name"]) == card_moves]
+            if len(same) != 1:
+                continue
+            current = products.get(known.get(card_id) or 0)
+            # Sin producto, o con uno de otros ataques (otra versión de la carta): el del catálogo.
+            if current is None or (card_moves and moves(current["name"]) and moves(current["name"]) != card_moves):
+                found[card_id] = same[0]["idProduct"]
+    print(f"catálogo de Cardmarket: {len(found)} cartas con su producto por nombre y ataques", flush=True)
+    return found
 
 
 def main(output):
@@ -72,9 +160,10 @@ def main(output):
     with open(cache_path, "w") as file:
         json.dump(known, file, separators=(",", ":"), sort_keys=True)
 
+    products = known | by_catalog(known, folder)
     guide = {item["idProduct"]: item for item in (get(GUIDE) or {}).get("priceGuides", [])}
     prices = {}
-    for card_id, product in known.items():
+    for card_id, product in products.items():
         item = guide.get(product)
         if not item:
             continue
