@@ -9,6 +9,8 @@ Para cada carta sin foto busca la de la misma carta en otro sitio:
   5. Webs oficiales: pokemon-card.com (Pokémon japonés), world.digimoncard.com (Digimon),
      en.onepiece-cardgame.com (One Piece), en.ws-tcg.com (Weiss Schwarz) y Scryfall (Magic), por expansión y
      número o por código.
+  6. Pokémon japonés que no está en ninguna parte (las colecciones HeartGold y SoulSilver, los mazos de 2003 a 2010…):
+     la misma carta en inglés (mismo nombre, PS y ataques), que lleva el mismo dibujo.
 
 Genera data/imagenes-cartas.json: {"actualizado": "...", "imagenes": {"<productId>": "<url>"}, "vacias": [<groupId>],
 "nitidas": {"<productId>": "<url>"}} («vacias»: expansiones sin ningún producto en el catálogo, que la app no enseña;
@@ -70,12 +72,15 @@ def letters(text):
 
 # Abreviatura de cada grupo («M-P», «SV-P»): en las promos japonesas el nombre no lleva el código delante.
 ABBREVIATIONS = {}
+# Fecha de salida de cada grupo (para elegir, entre varias impresiones inglesas, la más cercana a la japonesa).
+DATES = {}
 
 
 def load_category(category):
     """Grupos, cartas (con número) y grupos vacíos (sin ningún producto) de una categoría."""
     groups = (get(f"{TCGCSV}/{category}/groups") or {}).get("results", [])
     ABBREVIATIONS.update({g["groupId"]: (g.get("abbreviation") or "").strip() for g in groups})
+    DATES.update({g["groupId"]: (g.get("publishedOn") or "")[:10] for g in groups})
     empty = []
 
     def fetch(group):
@@ -90,12 +95,70 @@ def load_category(category):
             if number:
                 rows.append({"id": product["productId"], "group": group["groupId"], "name": product["name"],
                              "number": number, "images": product.get("imageCount") or 0,
-                             "url": product.get("imageUrl")})
+                             "url": product.get("imageUrl"), "card": card_signature(product) if category in (3, 85) else None})
         return rows
 
     with cf.ThreadPoolExecutor(16) as pool:
         products = [row for rows in pool.map(fetch, groups) for row in rows]
     return {g["groupId"]: g["name"] for g in groups}, products, empty
+
+
+def card_signature(product):
+    """Pokémon: nombre, PS y ataques (nombre y daño), como los escribe TCGplayer en inglés también en las japonesas.
+    None si no tiene ataques (Entrenadores y Energías: cada impresión lleva otro dibujo)."""
+    extended = {e["name"]: e["value"] for e in product.get("extendedData", [])}
+    moves = []
+    for key in sorted(k for k in extended if k.startswith("Attack")):
+        text = re.sub(r"<[^>]*>.*$", "", extended[key])
+        text = re.sub(r"\[[^\]]*\]", "", text).strip()
+        found = re.match(r"(.+?)\s*(?:\(([^)]*)\))?$", text)
+        if found:
+            moves.append([found.group(1).strip().lower(), (found.group(2) or "").strip()])
+    if not moves:
+        return None
+    # «Delta Species» es otra carta (otro tipo y otro dibujo) con el mismo nombre.
+    delta = "delta" in product["name"].lower() or "δ" in product["name"]
+    return [base_name(product["name"]) + (" δ" if delta else ""), extended.get("HP", ""), sorted(moves)]
+
+
+def english_twins(missing, english):
+    """Pokémon japonés sin foto en ningún sitio: la de la misma carta en inglés (mismo nombre, PS y ataques). Si hay
+    varias impresiones, la que salió más cerca de la japonesa (las reimpresiones mucho después pueden llevar otro dibujo)."""
+    def same_art(product):
+        """Solo etiquetas de acabado, sello o número de mazo («Mirror Holofoil», «League Promo», «#3», «Prime»): no las
+        que distinguen dibujos («Ditto (Squirtle)», con otro dibujo para cada Pokémon que imita)."""
+        return all(FINISH.search(tag) or re.fullmatch(r"#?\d+|prime|delta species|league promo", tag, re.I)
+                   for tag in tags(product["name"]))
+
+    by_card = {}
+    for product in english:
+        if product["card"] and product["images"] and product["url"] and same_art(product):
+            by_card.setdefault(json.dumps(product["card"]), []).append(product)
+
+    def days(group):
+        try:
+            return datetime.date.fromisoformat(DATES.get(group) or "")
+        except ValueError:
+            return None
+
+    found = {}
+    for product in missing:
+        twins = by_card.get(json.dumps(product["card"])) if product["card"] else None
+        if not twins:
+            continue
+        # Dos cartas distintas de una misma expansión con el mismo texto (los Unown, uno por letra): otro dibujo cada
+        # una, no se sabe cuál es.
+        numbers = {}
+        for twin in twins:
+            numbers.setdefault(twin["group"], set()).add(number_key(twin["number"]))
+        if any(len(found_numbers) > 1 for found_numbers in numbers.values()):
+            continue
+        mine = days(product["group"])
+        # La de fecha más cercana y, a igual fecha, la normal (sin acabado entre paréntesis).
+        twins = sorted(twins, key=lambda twin: (abs((days(twin["group"]) - mine).days) if mine and days(twin["group"]) else 99999,
+                                                bool(tags(twin["name"]))))
+        found[str(product["id"])] = twins[0]["url"]
+    return found
 
 
 def tcgdex_images(language, set_ids):
@@ -444,6 +507,7 @@ def reprint_originals(products):
 
 def build(cache_path):
     images, empty, sharper = {}, [], {}
+    english = []
     for category in CATEGORIES:
         groups, products, empty_groups = load_category(category)
         empty += empty_groups
@@ -482,8 +546,11 @@ def build(cache_path):
         if category == 3:
             extra |= championship_originals(rest, with_image, groups)
             sharper = pokemon_sharper(with_image, groups, os.path.join(os.path.dirname(cache_path), "anchos-tcgplayer.json"))
+        if category == 3:
+            english = products
         if category == 85:
             extra |= pokemon_jp_official(rest, groups, cache_path)
+            extra |= english_twins([p for p in rest if str(p["id"]) not in extra], english)
         elif category == 63:
             extra |= official_by_code(rest, "https://world.digimoncard.com/images/cardlist/card/{code}.png",
                                       lambda p: (re.match(r"[A-Z]{1,4}\d{0,2}-\d{2,3}", p["number"].strip()) or [None])[0])
