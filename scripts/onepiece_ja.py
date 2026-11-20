@@ -7,7 +7,8 @@ que existe en japonés y elige la foto de cada variante sin tener que probar dir
 Genera data/onepiece-ja.json: {"actualizado": "...", "cartas": {"OP01-001": ["", "_p1"], ...}}.
 Con un segundo archivo, también el nombre japonés, el tipo y la fuerza de cada código, para que el escáner reconozca por
 el nombre las que no deja leer el código (las alternativas a toda carta): {"actualizado": "...", "nombres":
-{"OP01-001": ["ロロノア・ゾロ", "LEADER", 5000], ...}} (fuerza null en eventos y escenarios).
+{"OP01-001": ["ロロノア・ゾロ", "LEADER", 5000, "超新星/麦わらの一味"], ...}} (fuerza null en eventos y escenarios;
+lo último son los rasgos, que van impresos debajo del nombre y a veces son el nombre de otra carta: «白ひげ海賊団»).
 Uso: python3 scripts/onepiece_ja.py data/onepiece-ja.json [data/onepiece-ja-nombres.json]
 """
 import datetime
@@ -33,7 +34,7 @@ def page(url, tries=3):
 
 
 def card_names(text):
-    """Nombre, tipo y fuerza de cada código en una página de la lista oficial."""
+    """Nombre, tipo, fuerza y rasgos de cada código en una página de la lista oficial."""
     names = {}
     for block_id, body in re.findall(r'<dl class="modalCol" id="([^"]+)">(.*?)</dl>', text, re.S):
         info = re.search(r'class="infoCol">(.*?)</div>', body, re.S)
@@ -43,8 +44,10 @@ def card_names(text):
         spans = [value.strip() for value in re.findall(r"<span>([^<]*)</span>", info.group(1))]
         code = spans[0] if spans else block_id.split("_")[0]
         power = re.search(r'class="power"><h3>[^<]*</h3>\s*([0-9]+)', body)
+        feature = re.search(r'class="feature"><h3>[^<]*</h3>([^<]*)<', body)
         if code not in names and name.group(1).strip():
-            names[code] = [name.group(1).strip(), spans[2] if len(spans) > 2 else "", int(power.group(1)) if power else None]
+            names[code] = [name.group(1).strip(), spans[2] if len(spans) > 2 else "", int(power.group(1)) if power else None,
+                           feature.group(1).strip() if feature else ""]
     return names
 
 
