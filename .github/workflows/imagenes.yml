@@ -29,7 +29,7 @@ jobs:
           done
         continue-on-error: true
       - name: One Piece en japonés
-        run: python3 scripts/onepiece_ja.py data/onepiece-ja.json
+        run: python3 scripts/onepiece_ja.py data/onepiece-ja.json data/onepiece-ja-nombres.json
         continue-on-error: true
       # Compara los dibujos (Pillow): solo lo nuevo, lo ya emparejado se guarda en el mismo archivo.
       - name: Foto japonesa de cada versión de One Piece
