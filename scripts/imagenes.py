@@ -66,6 +66,25 @@ def clean_name(name):
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
+def colored_promos(missing, with_image, groups):
+    """Yu-Gi-Oh!: promos de liga con color («Call of the Mummy (Red)», «(Blue)»…) y rarezas abreviadas («(UTR)»,
+    «(SE)»): solo cambia el brillo, el dibujo es el de la carta normal (mismo nombre). Las fichas («Token: Ojama
+    (Blue)») no: cada color es otra ficha."""
+    tag = re.compile(r"\s*\((?:red|blue|green|purple|bronze|silver|gold|utr|se|ur|scr|sr|qcsr|pscr)\)", re.I)
+    by_name = {}
+    for product in with_image:
+        if plain(product) and not tag.search(product["name"]):
+            by_name.setdefault(clean_name(product["name"]), product["url"])
+    found = {}
+    for product in missing:
+        if "token" in product["name"].lower() or not tag.search(product["name"]):
+            continue
+        url = by_name.get(clean_name(tag.sub("", product["name"])))
+        if url:
+            found[str(product["id"])] = url
+    return found
+
+
 def letters(text):
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
@@ -111,9 +130,13 @@ def card_signature(product):
     for key in sorted(k for k in extended if k.startswith("Attack")):
         text = re.sub(r"<[^>]*>.*$", "", extended[key])
         text = re.sub(r"\[[^\]]*\]", "", text).strip()
-        found = re.match(r"(.+?)\s*(?:\(([^)]*)\))?$", text)
+        # En las expansiones antiguas el texto del ataque va detrás del nombre: «Spider Web - The Defending Pokémon…»,
+        # «Leech Life (30) Remove from…». Solo cuentan el nombre y el daño.
+        text = re.split(r"\s+[-–]\s+", text)[0]
+        found = re.match(r"([^(]+)(?:\(([^)]*)\))?", text)
         if found:
-            moves.append([found.group(1).strip().lower(), (found.group(2) or "").strip()])
+            damage = (found.group(2) or "").strip()
+            moves.append([found.group(1).strip().lower(), damage if re.fullmatch(r"\d+[x×+\-]?", damage) else ""])
     if not moves:
         return None
     # «Delta Species» es otra carta (otro tipo y otro dibujo) con el mismo nombre.
@@ -158,6 +181,36 @@ def english_twins(missing, english):
         twins = sorted(twins, key=lambda twin: (abs((days(twin["group"]) - mine).days) if mine and days(twin["group"]) else 99999,
                                                 bool(tags(twin["name"]))))
         found[str(product["id"])] = twins[0]["url"]
+    return found
+
+
+def release_day(group):
+    try:
+        return datetime.date.fromisoformat(DATES.get(group) or "")
+    except ValueError:
+        return None
+
+
+def kit_twins(missing, english, groups):
+    """Kits de entrenador (Trainer Kits): reimpresiones de cartas de su época con el mismo dibujo y la numeración del kit
+    («Caterpie 1/30»). Los Pokémon, como las gemelas japonesas (mismo nombre, PS y ataques); las Energías y los
+    Entrenadores, por el nombre en la expansión normal más cercana (como mucho dos años: después cambia el dibujo)."""
+    kit = [p for p in missing if "trainer kit" in groups.get(p["group"], "").lower()]
+    found = english_twins([p for p in kit if p["card"]], english)
+    by_name = {}
+    for product in english:
+        if (product["images"] and product["url"] and not tags(product["name"]) and not product["card"]
+                and "trainer kit" not in groups.get(product["group"], "").lower()):
+            by_name.setdefault(base_name(product["name"]), []).append(product)
+    for product in kit:
+        mine = release_day(product["group"])
+        if product["card"] or str(product["id"]) in found or not mine:
+            continue
+        options = [(abs((release_day(o["group"]) - mine).days), o) for o in by_name.get(base_name(product["name"]), [])
+                   if release_day(o["group"])]
+        options = sorted((o for o in options if o[0] <= 730), key=lambda o: o[0])
+        if options:
+            found[str(product["id"])] = options[0][1]["url"]
     return found
 
 
@@ -215,7 +268,7 @@ def tags(name):
 
 def base_name(name):
     name = re.sub(r"[(\[][^)\]]*[)\]]", "", name)
-    name = re.sub(r"\s+-\s+[A-Z]{0,4}\d{1,4}(?:/\d{1,4})?\s*$", "", name)
+    name = re.sub(r"\s+-\s+[A-Z]{0,4}\d{1,4}[a-z]?(?:/\d{1,4})?\s*$", "", name)
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
@@ -229,16 +282,24 @@ def finish_variants(missing, with_image):
     """Foto de la misma carta (mismo nombre y número, en la misma expansión o en otra) con otro acabado."""
     index = {}
     for product in with_image:
-        index.setdefault((base_name(product["name"]), product["number"].strip().upper()), []).append(product)
+        index.setdefault((base_name(product["name"]), same_number(product["number"])), []).append(product)
     found = {}
     for product in missing:
-        key = (base_name(product["name"]), product["number"].strip().upper())
+        key = (base_name(product["name"]), same_number(product["number"]))
         # Primero la de la misma expansión.
         options = sorted(index.get(key, []), key=lambda o: o["group"] != product["group"])
         match = next((o for o in options if same_face(product, o)), None)
         if match:
             found[str(product["id"])] = match["url"]
     return found
+
+
+def same_number(number):
+    """Número para comparar impresiones: sin ceros delante («051/236» = «51/236») ni la letra de las reimpresiones de
+    liga («135a/156» = «135/156», con el mismo dibujo y el sello de la liga)."""
+    parts = [re.sub(r"^0+(?=\d)", "", part.strip()) for part in number.strip().upper().split("/")]
+    parts[0] = re.sub(r"(?<=\d)A$", "", parts[0])
+    return "/".join(parts)
 
 
 def plain(product):
@@ -290,6 +351,86 @@ def official_by_code(missing, template, code_of, exact=False):
 
     with cf.ThreadPoolExecutor(6) as pool:
         return {pid: url for pid, url in pool.map(check, candidates) if url}
+
+
+def official_parallels(missing, products, template, code_of):
+    """Ilustración alternativa (Alternate Art) sin foto: si TCGplayer solo tiene una versión alternativa de ese código y
+    la web oficial solo una paralela («BT27-084_P1»), son la misma. Con varias no se sabe cuál es cuál."""
+    alternates = {}
+    for product in products:
+        code = code_of(product)
+        if code and not plain(product):
+            alternates.setdefault(code, []).append(product)
+    codes = {code_of(p) for p in missing if not plain(p)} - {None}
+    codes = [c for c in codes if len(alternates.get(c, [])) == 1]
+
+    def check(code):
+        urls = []
+        for n in range(1, 4):
+            url = template.format(code=f"{code}_P{n}")
+            if not exists(url):
+                break
+            urls.append(url)
+        return code, urls
+
+    with cf.ThreadPoolExecutor(6) as pool:
+        return {str(alternates[code][0]["id"]): urls[0] for code, urls in pool.map(check, codes) if len(urls) == 1}
+
+
+def riftbound_gallery():
+    """Cartas de la galería oficial de Riftbound (playriftbound.com): {código: url}, p. ej. «VEN-139/166», «UNL-T02»."""
+    request = urllib.request.Request("https://playriftbound.com/en-us/card-gallery/", headers={"User-Agent": "Mozilla/5.0 (FoilScan image index)"})
+    try:
+        html = urllib.request.urlopen(request, timeout=60).read().decode("utf-8", "replace")
+        data = json.loads(re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S).group(1))
+    except Exception:
+        return {}, {}
+    cards = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "publicCode" in node and isinstance(node.get("cardImage"), dict):
+                cards.append(node)
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(data)
+    # La foto en JPEG de 500 px (la original es un PNG de más de 1 MB).
+    by_code = {c["publicCode"]: c["cardImage"]["url"] + ("&" if "?" in c["cardImage"]["url"] else "?") + "w=500&fm=jpg&q=85"
+               for c in cards if c["cardImage"].get("url")}
+    names = {}
+    for card in cards:
+        if re.fullmatch(r"[A-Z]{3}-T\d+", card["publicCode"]):
+            names.setdefault(card["name"].strip().lower(), set()).add(by_code[card["publicCode"]])
+    tokens = {name: urls.pop() for name, urls in names.items() if len(urls) == 1}
+    return by_code, tokens
+
+
+def riftbound(missing):
+    """Riftbound: foto de la galería oficial por expansión y número («139/166» = VEN-139/166, que TCGplayer da sin la
+    expansión), también para las promos de metal y de torneo con el mismo número; las fichas dobles («Bird // Buff»),
+    con la de su cara delantera."""
+    by_code, tokens = riftbound_gallery()
+    sets = {}
+    for code in by_code:
+        match = re.fullmatch(r"([A-Z]{3})-\d{3}[a-z*]?/(\d{3})", code)
+        if match:
+            sets.setdefault(int(match.group(2)), set()).add(match.group(1))
+    found = {}
+    for product in missing:
+        number = product["number"].strip()
+        if "//" in number or re.fullmatch(r"T\d+", number):
+            url = tokens.get(product["name"].split("//")[0].strip().lower())
+        else:
+            match = re.fullmatch(r"0*(\d+)([a-z*]?)/0*(\d+)", number)
+            options = sets.get(int(match.group(3)), set()) if match else set()
+            url = by_code.get(f"{next(iter(options))}-{int(match.group(1)):03d}{match.group(2)}/{int(match.group(3)):03d}") if len(options) == 1 else None
+        if url:
+            found[str(product["id"])] = url
+    return found
 
 
 def scryfall(missing):
@@ -545,6 +686,7 @@ def build(cache_path):
         rest = [p for p in rest if str(p["id"]) not in extra]
         if category == 3:
             extra |= championship_originals(rest, with_image, groups)
+            extra |= kit_twins([p for p in rest if str(p["id"]) not in extra], products, groups)
             sharper = pokemon_sharper(with_image, groups, os.path.join(os.path.dirname(cache_path), "anchos-tcgplayer.json"))
         if category == 3:
             english = products
@@ -552,13 +694,25 @@ def build(cache_path):
             extra |= pokemon_jp_official(rest, groups, cache_path)
             extra |= english_twins([p for p in rest if str(p["id"]) not in extra], english)
         elif category == 63:
-            extra |= official_by_code(rest, "https://world.digimoncard.com/images/cardlist/card/{code}.png",
-                                      lambda p: (re.match(r"[A-Z]{1,4}\d{0,2}-\d{2,3}", p["number"].strip()) or [None])[0])
+            digimon_code = lambda p: (re.match(r"[A-Z]{1,4}\d{0,2}-\d{2,3}", p["number"].strip()) or [None])[0]
+            extra |= official_by_code(rest, "https://world.digimoncard.com/images/cardlist/card/{code}.png", digimon_code)
+            extra |= official_parallels([p for p in rest if str(p["id"]) not in extra], products,
+                                        "https://world.digimoncard.com/images/cardlist/card/{code}.png", digimon_code)
         elif category == 68:
             extra |= official_by_code(rest, "https://en.onepiece-cardgame.com/images/cardlist/card/{code}.png",
                                       lambda p: (re.match(r"[A-Z]{1,4}\d{0,2}-\d{2,3}", p["number"].strip()) or [None])[0])
         elif category == 1:
             extra |= scryfall(rest)
+        elif category == 2:
+            extra |= colored_promos(rest, with_image, groups)
+        elif category == 89:
+            extra |= riftbound(rest)
+        elif category == 80:
+            extra |= official_by_code(rest, "https://www.dbs-cardgame.com/fw/images/cards/card/en/{code}.webp",
+                                      lambda p: (re.match(r"F[BSP]\d{2}-\d{2,3}", p["number"].strip()) or [None])[0])
+        elif category == 81:
+            extra |= official_by_code(rest, "https://www.unionarena-tcg.com/na/images/cardlist/card/{code}.png",
+                                      lambda p: p["number"].strip().replace("/", "_") if re.fullmatch(r"[A-Z0-9]+/[A-Z]{2,4}-\d-\d{3}", p["number"].strip()) else None)
         elif category == 20:
             extra |= official_by_code(rest, "https://en.ws-tcg.com/wordpress/wp-content/images/cardimages/{code}.png",
                                       weiss_path, exact=True)
