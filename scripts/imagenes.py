@@ -398,13 +398,16 @@ def riftbound_gallery():
             for value in node:
                 walk(value)
     walk(data)
-    # La foto en JPEG de 500 px (la original es un PNG de más de 1 MB).
-    by_code = {c["publicCode"]: c["cardImage"]["url"] + ("&" if "?" in c["cardImage"]["url"] else "?") + "w=500&fm=jpg&q=85"
-               for c in cards if c["cardImage"].get("url")}
-    names = {}
+    # La foto en JPEG de 500 px (la original es un PNG de más de 1 MB), con el nombre de la carta para comprobarla.
+    by_code = {}
     for card in cards:
-        if re.fullmatch(r"[A-Z]{3}-T\d+", card["publicCode"]):
-            names.setdefault(card["name"].strip().lower(), set()).add(by_code[card["publicCode"]])
+        url, code = card["cardImage"].get("url"), card.get("publicCode")
+        if url and isinstance(code, str):
+            by_code[code] = (url + ("&" if "?" in url else "?") + "w=500&fm=jpg&q=85", (card.get("name") or "").strip().lower())
+    names = {}
+    for code, (url, name) in by_code.items():
+        if name and re.fullmatch(r"[A-Z]{3}-T\d+", code):
+            names.setdefault(name, set()).add(url)
     tokens = {name: urls.pop() for name, urls in names.items() if len(urls) == 1}
     return by_code, tokens
 
@@ -427,7 +430,10 @@ def riftbound(missing):
         else:
             match = re.fullmatch(r"0*(\d+)([a-z*]?)/0*(\d+)", number)
             options = sets.get(int(match.group(3)), set()) if match else set()
-            url = by_code.get(f"{next(iter(options))}-{int(match.group(1)):03d}{match.group(2)}/{int(match.group(3)):03d}") if len(options) == 1 else None
+            card = by_code.get(f"{next(iter(options))}-{int(match.group(1)):03d}{match.group(2)}/{int(match.group(3)):03d}") if len(options) == 1 else None
+            # La expansión sale solo del total: si es de otra con el mismo total (una que la galería aún no tiene), el
+            # nombre no casa y no se usa («Akali, Rogue Assassin» contiene «rogue assassin»).
+            url = card[0] if card and card[1] and card[1] in product["name"].lower() else None
         if url:
             found[str(product["id"])] = url
     return found
@@ -442,14 +448,15 @@ def scryfall(missing):
         number = product["number"].split("/")[0].strip().lstrip("0") or "0"
         query = urllib.parse.quote(f'!"{base_name(product["name"])}" cn:{number}')
         data = get(f"https://api.scryfall.com/cards/search?q={query}&unique=prints") or {}
-        time.sleep(0.12)
+        # Las búsquedas de Scryfall, como mucho 2 por segundo (más deprisa responde 429).
+        time.sleep(0.6)
         cards = data.get("data") or []
         if not cards:
             # TCGplayer y Scryfall numeran distinto algunas expansiones («Commander: Marvel Super Heroes»): por
             # nombre, y solo vale si todas sus ediciones tienen la misma ilustración (se comprueba más abajo).
             query = urllib.parse.quote(f'!"{base_name(product["name"])}"')
             data = get(f"https://api.scryfall.com/cards/search?q={query}&unique=prints") or {}
-            time.sleep(0.12)
+            time.sleep(0.6)
             cards = data.get("data") or []
         # La versión numerada («Serial Numbered») es la «559z»; si no, la del número exacto.
         serial = any("serial" in t.lower() for t in tags(product["name"]))
@@ -657,7 +664,9 @@ def magic_sharper(with_image, widths_path):
             # Las búsquedas de Scryfall, como mucho 2 por segundo (más deprisa responde 429 y se perdían expansiones).
             time.sleep(0.6)
             for card in page.get("data", []):
-                image = (card.get("image_uris") or (card.get("card_faces") or [{}])[0].get("image_uris") or {}).get("large")
+                # «normal» (488 px): casi el doble que la de TCGplayer y la mitad de peso que «large» (también va en las
+                # listas de cartas, no solo en la ficha).
+                image = (card.get("image_uris") or (card.get("card_faces") or [{}])[0].get("image_uris") or {}).get("normal")
                 for key in ("tcgplayer_id", "tcgplayer_etched_id"):
                     if image and card.get(key):
                         large[str(card[key])] = image
