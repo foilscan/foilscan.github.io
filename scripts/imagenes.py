@@ -612,6 +612,61 @@ def pokemon_sharper(with_image, groups, widths_path):
     return result
 
 
+def magic_sharper(with_image, widths_path):
+    """Magic con foto pequeña en TCGplayer (las expansiones de 2021 a 2023 están enteras a 265 px: Strixhaven, Innistrad,
+    Streets of New Capenna, Dominaria United, The Brothers' War…): la grande de Scryfall, que dice el producto de
+    TCGplayer de cada carta. Se miden dos cartas por expansión y, si solo una es pequeña, todas las de esa expansión (los
+    anchos se guardan en `widths_path`, como los de Pokémon)."""
+    try:
+        with open(widths_path) as file:
+            widths = json.load(file)
+    except (OSError, ValueError):
+        widths = {}
+
+    def measure(products):
+        pending = [p for p in products if str(p["id"]) not in widths]
+        with cf.ThreadPoolExecutor(8) as pool:
+            for product, width in zip(pending, pool.map(lambda p: tcgplayer_width(p["id"]), pending)):
+                if width:
+                    widths[str(product["id"])] = width
+
+    by_group = {}
+    for product in with_image:
+        by_group.setdefault(product["group"], []).append(product)
+    samples = {group: sorted(products, key=lambda p: p["id"])[:2] for group, products in by_group.items()}
+    measure([p for products in samples.values() for p in products])
+    small_groups, mixed = set(), set()
+    for group, products in samples.items():
+        flags = [widths.get(str(p["id"]), SMALL) < SMALL for p in products]
+        if flags and all(flags):
+            small_groups.add(group)
+        elif any(flags):
+            mixed.add(group)
+    measure([p for group in mixed for p in by_group[group]])
+    with open(widths_path, "w") as file:
+        json.dump(widths, file, separators=(",", ":"), sort_keys=True)
+    small = [p for p in with_image if p["group"] in small_groups
+             or (p["group"] in mixed and widths.get(str(p["id"]), SMALL) < SMALL)]
+    sets = {s["tcgplayer_id"]: s["search_uri"] for s in (get("https://api.scryfall.com/sets") or {}).get("data", [])
+            if s.get("tcgplayer_id") and s.get("search_uri")}
+    large = {}
+    for group in {p["group"] for p in small}:
+        url = sets.get(group)
+        while url:
+            page = get(url) or {}
+            # Las búsquedas de Scryfall, como mucho 2 por segundo (más deprisa responde 429 y se perdían expansiones).
+            time.sleep(0.6)
+            for card in page.get("data", []):
+                image = (card.get("image_uris") or (card.get("card_faces") or [{}])[0].get("image_uris") or {}).get("large")
+                for key in ("tcgplayer_id", "tcgplayer_etched_id"):
+                    if image and card.get(key):
+                        large[str(card[key])] = image
+            url = page.get("next_page") if page.get("has_more") else None
+    result = {str(p["id"]): large[str(p["id"])] for p in small if str(p["id"]) in large}
+    print(f"Magic: {len(small)} con foto pequeña, {len(result)} con la de Scryfall", flush=True)
+    return result
+
+
 def reprint_originals(products):
     """Reimpresiones de otra expansión (Deck Exclusives, League & Championship, Prize Pack…): llevan el número y el total
     de la original («Garchomp - 5/147 (Championship Promo)» → la Garchomp 5/147 de Supreme Victors). Por número, total
@@ -687,7 +742,7 @@ def build(cache_path):
         if category == 3:
             extra |= championship_originals(rest, with_image, groups)
             extra |= kit_twins([p for p in rest if str(p["id"]) not in extra], products, groups)
-            sharper = pokemon_sharper(with_image, groups, os.path.join(os.path.dirname(cache_path), "anchos-tcgplayer.json"))
+            sharper |= pokemon_sharper(with_image, groups, os.path.join(os.path.dirname(cache_path), "anchos-tcgplayer.json"))
         if category == 3:
             english = products
         if category == 85:
@@ -703,6 +758,7 @@ def build(cache_path):
                                       lambda p: (re.match(r"[A-Z]{1,4}\d{0,2}-\d{2,3}", p["number"].strip()) or [None])[0])
         elif category == 1:
             extra |= scryfall(rest)
+            sharper |= magic_sharper(with_image, os.path.join(os.path.dirname(cache_path), "anchos-tcgplayer.json"))
         elif category == 2:
             extra |= colored_promos(rest, with_image, groups)
         elif category == 89:
